@@ -262,7 +262,6 @@ int wmain(int, wchar_t**) {
         opts.hosts.push_back({ L"wd.mihoyo.com", L"" });
         opts.hosts.push_back({ L"mhyy.mihoyo.com", L"" });
         opts.hosts.push_back({ L"webstatic.mihoyo.com", L"" });
-        opts.hosts.push_back({ L"webstatic-sea.mihoyo.com", L"" });
         opts.hosts.push_back({ L"sdk-static.mihoyo.com", L"" });
         opts.hosts.push_back({ L"api-static.mihoyo.com", L"" });
         opts.hosts.push_back({ L"api-takumi.mihoyo.com", L"" });
