@@ -279,12 +279,10 @@ int wmain(int, wchar_t**) {
         return 1;
     }
 
-    opts.startUrl = L"https://github.com/chen-linkai/ocths-cealer";
-
     switch (LaunchBrowser(opts)) {
     case LaunchResult::Success: {
         MessageBoxW(GetParentWindow(), 
-                    L"Ceal this fxxking shit.",
+                    L"Ceal this fxxking shit.\n\nSee more on https://github.com/chen-linkai/ocths-cealer.",
                     L"clk PRESENT", MB_OK | MB_ICONINFORMATION | MB_DEFBUTTON1);
         return 0;
     }
