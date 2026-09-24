@@ -31,7 +31,7 @@ struct HostMapping {
 struct LaunchOptions {
     std::vector<HostMapping> hosts;
     std::wstring startUrl;
-    std::wstring userDataDir = L"C:\\Temp\\BrowserHostTest";
+    std::wstring userDataDir = L"C:\\Temp\\OCTHS-Cealer";
     std::wstring browserPath;
     std::wstring extraFlags;
     std::wstring dnsServer;
