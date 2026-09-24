@@ -279,6 +279,8 @@ int wmain(int, wchar_t**) {
         return 1;
     }
 
+    opts.startUrl = L"https://github.com/chen-linkai/ocths-cealer";
+
     switch (LaunchBrowser(opts)) {
     case LaunchResult::Success: {
         MessageBoxW(GetParentWindow(), 
