@@ -241,6 +241,8 @@ public:
 
     unsigned short Port() const { return port_; }
 
+    void SetPacContent(std::string pac) { pacContent_ = std::move(pac); }
+
 private:
     void AcceptLoop() {
         while (running_) {
@@ -332,6 +334,16 @@ private:
         std::string method  = rl.substr(0, s1);
         std::string url     = rl.substr(s1 + 1, s2 - s1 - 1);
         std::string version = rl.substr(s2 + 1);
+
+        if (method == "GET" && url == "/proxy.pac") {
+            std::string resp = "HTTP/1.1 200 OK\r\n";
+            resp += "Content-Type: application/x-ns-proxy-autoconfig\r\n";
+            resp += "Content-Length: " + std::to_string(pacContent_.size()) + "\r\n";
+            resp += "Connection: close\r\n\r\n";
+            resp += pacContent_;
+            send(client.get(), resp.c_str(), (int)resp.size(), 0);
+            return;
+        }
 
         if (ToLower(method) == "connect") {
             std::string hostPort = url;
@@ -448,6 +460,7 @@ private:
         Relay(client.get(), target.get());
     }
 
+    std::string pacContent_;
     std::map<std::string, std::string> routes_;
     ScopedSocket listen_;
     unsigned short targetPort_;
@@ -459,8 +472,8 @@ private:
     bool wsaStarted_ = false;
 };
 
-static std::wstring WritePacFile(const std::vector<HostMapping>& hosts,
-                                 unsigned short proxyPort)
+static std::string BuildPacContent(const std::vector<HostMapping>& hosts,
+                                   unsigned short proxyPort)
 {
     std::string list;
     bool first = true;
@@ -471,28 +484,15 @@ static std::wstring WritePacFile(const std::vector<HostMapping>& hosts,
         list += "\"" + WtoA(h.domain) + "\"";
     }
 
-    std::string pac =
-        "function FindProxyForURL(url, host) {\n"
-        "    host = host.toLowerCase();\n"
-        "    var list = [" + list + "];\n"
-        "    for (var i = 0; i < list.length; i++) {\n"
-        "        if (host == list[i])\n"
-        "            return \"PROXY 127.0.0.1:" + std::to_string(proxyPort) + "\";\n"
-        "    }\n"
-        "    return \"DIRECT\";\n"
-        "}\n";
-
-    wchar_t tmp[MAX_PATH] = {};
-    GetTempPathW(MAX_PATH, tmp);
-    std::wstring path = std::wstring(tmp) + L"ocths_cealer_routes.pac";
-
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return {};
-    DWORD written = 0;
-    WriteFile(h, pac.c_str(), (DWORD)pac.size(), &written, nullptr);
-    CloseHandle(h);
-    return path;
+    return "function FindProxyForURL(url, host) {\n"
+           "    host = host.toLowerCase();\n"
+           "    var list = [" + list + "];\n"
+           "    for (var i = 0; i < list.length; i++) {\n"
+           "        if (host == list[i])\n"
+           "            return \"PROXY 127.0.0.1:" + std::to_string(proxyPort) + "\";\n"
+           "    }\n"
+           "    return \"DIRECT\";\n"
+           "}\n";
 }
 
 int wmain(int, wchar_t**) {
@@ -579,20 +579,15 @@ int wmain(int, wchar_t**) {
     }
 
     RedirectProxy proxy(hosts, 80);
+    proxy.SetPacContent(BuildPacContent(hosts, 0));
     if (!proxy.Start()) {
         ShowError(L"本地代理启动失败。");
         return 1;
     }
+    proxy.SetPacContent(BuildPacContent(hosts, proxy.Port()));
 
-    std::wstring pacPath = WritePacFile(hosts, proxy.Port());
-    if (pacPath.empty()) {
-        ShowError(L"PAC 文件写入失败。");
-        proxy.Stop();
-        return 1;
-    }
-
-    std::wstring pacUrl = L"file:///";
-    for (wchar_t c : pacPath) pacUrl += (c == L'\\') ? L'/' : c;
+    std::wstring pacUrl =
+        L"http://127.0.0.1:" + std::to_wstring(proxy.Port()) + L"/proxy.pac";
 
     std::wstring browser = GetDefaultBrowserPath();
     if (browser.empty()) {
