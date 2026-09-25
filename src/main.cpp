@@ -538,6 +538,7 @@ int wmain(int, wchar_t**) {
     hosts.push_back({ L"account.mihoyo.com", L"" });
     hosts.push_back({ L"bbs.mihoyo.com", L"" });
     hosts.push_back({ L"ys.mihoyo.com", L"" });
+    hosts.push_back({ L"sr.mihoyo.com", L"" });
     hosts.push_back({ L"genshin.mihoyo.com", L"" });
     hosts.push_back({ L"zzz.mihoyo.com", L"" });
     hosts.push_back({ L"honkaiimpact3.mihoyo.com", L"" });
