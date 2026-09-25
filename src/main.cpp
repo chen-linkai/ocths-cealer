@@ -149,25 +149,6 @@ static bool ResolveViaDns(const std::wstring& host,
     return ok;
 }
 
-static bool ResolveAllHosts(std::vector<HostMapping>& hosts,
-                            const std::wstring& dnsServer,
-                            std::wstring& errorOut)
-{
-    for (auto& h : hosts) {
-        if (!h.ip.empty()) continue;
-        if (dnsServer.empty()) {
-            errorOut = L"host " + h.domain + L" 未提供 IP，且未指定 DNS";
-            return false;
-        }
-        std::wstring ip;
-        if (!ResolveViaDns(h.domain, dnsServer, ip)) {
-            ip = L"127.0.0.1";
-        }
-        h.ip = std::move(ip);
-    }
-    return true;
-}
-
 class ScopedSocket {
 public:
     ScopedSocket() = default;
@@ -187,13 +168,24 @@ private:
 
 class RedirectProxy {
 public:
-    RedirectProxy(const std::vector<HostMapping>& hosts, unsigned short targetPort = 80)
-        : targetPort_(targetPort) {
+    RedirectProxy(const std::vector<HostMapping>& hosts,
+                  const std::wstring& dnsServer,
+                  unsigned short targetPort = 80)
+        : targetPort_(targetPort), dnsServer_(dnsServer)
+    {
         for (const auto& h : hosts) {
-            if (h.domain.empty() || h.ip.empty()) continue;
-            routes_[ToLower(WtoA(h.domain))] = WtoA(h.ip);
+            if (h.domain.empty()) continue;
+            Pattern p;
+            p.raw = ToLower(WtoA(h.domain));
+            p.fixedIp = WtoA(h.ip);
+            if (p.raw.size() > 2 && p.raw[0] == '*' && p.raw[1] == '.') {
+                p.suffix = p.raw.substr(1);   // ".mihoyo.com"
+                p.isWildcard = true;
+            }
+            patterns_.push_back(std::move(p));
         }
     }
+
     ~RedirectProxy() { Stop(); }
 
     bool Start() {
@@ -244,6 +236,59 @@ public:
     void SetPacContent(std::string pac) { pacContent_ = std::move(pac); }
 
 private:
+    struct Pattern {
+        std::string raw;
+        std::string suffix;
+        std::string fixedIp;
+        bool isWildcard = false;
+    };
+
+    const Pattern* FindPattern(const std::string& host) const {
+        // 先精确匹配
+        for (const auto& p : patterns_) {
+            if (!p.isWildcard && p.raw == host) return &p;
+        }
+        // 再通配符匹配：xxx.com 本身 或 任意子域
+        for (const auto& p : patterns_) {
+            if (!p.isWildcard) continue;
+            const std::string& s = p.suffix;   // ".mihoyo.com"
+            if (host.size() > s.size() &&
+                host.compare(host.size() - s.size(), s.size(), s) == 0)
+                return &p;
+            if (host == s.substr(1)) return &p;   // "mihoyo.com"
+        }
+        return nullptr;
+    }
+
+    bool ResolveTarget(const std::string& host, const Pattern& p, std::string& outIp) {
+        if (!p.fixedIp.empty()) {
+            outIp = p.fixedIp;
+            return true;
+        }
+        {
+            std::lock_guard<std::mutex> lk(cacheMu_);
+            auto it = ipCache_.find(host);
+            if (it != ipCache_.end()) {
+                if (it->second.empty()) return false;
+                outIp = it->second;
+                return true;
+            }
+        }
+
+        std::wstring wHost(host.begin(), host.end());
+        std::wstring ip;
+        bool ok = !dnsServer_.empty() && ResolveViaDns(wHost, dnsServer_, ip);
+        std::string ipA = ok ? WtoA(ip) : std::string();
+
+        {
+            std::lock_guard<std::mutex> lk(cacheMu_);
+            ipCache_[host] = ipA;
+        }
+        if (!ok) return false;
+        outIp = ipA;
+        return true;
+    }
+
     void AcceptLoop() {
         while (running_) {
             SOCKET c = accept(listen_.get(), nullptr, nullptr);
@@ -345,6 +390,7 @@ private:
             return;
         }
 
+        // CONNECT
         if (ToLower(method) == "connect") {
             std::string hostPort = url;
             std::string host = hostPort;
@@ -356,9 +402,17 @@ private:
             }
             host = ToLower(host);
 
-            auto itc = routes_.find(host);
-            if (itc == routes_.end()) {
+            const Pattern* pat = FindPattern(host);
+            if (!pat) {
                 const char* r = "HTTP/1.1 403 Forbidden\r\n"
+                                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+                send(client.get(), r, (int)strlen(r), 0);
+                return;
+            }
+
+            std::string targetIp;
+            if (!ResolveTarget(host, *pat, targetIp)) {
+                const char* r = "HTTP/1.1 502 Bad Gateway\r\n"
                                 "Content-Length: 0\r\nConnection: close\r\n\r\n";
                 send(client.get(), r, (int)strlen(r), 0);
                 return;
@@ -373,7 +427,7 @@ private:
             sockaddr_in ta{};
             ta.sin_family = AF_INET;
             ta.sin_port   = htons(dstPort);
-            if (InetPtonA(AF_INET, itc->second.c_str(), &ta.sin_addr) != 1) return;
+            if (InetPtonA(AF_INET, targetIp.c_str(), &ta.sin_addr) != 1) return;
             if (connect(target.get(), (sockaddr*)&ta, sizeof(ta)) == SOCKET_ERROR) {
                 const char* r = "HTTP/1.1 502 Bad Gateway\r\n"
                                 "Content-Length: 0\r\nConnection: close\r\n\r\n";
@@ -388,6 +442,7 @@ private:
             return;
         }
 
+        // 普通 HTTP
         std::string hostHeader;
         for (size_t i = 1; i < lines.size(); ++i) {
             size_t c = lines[i].find(':');
@@ -405,9 +460,17 @@ private:
         }
         hostOnly = ToLower(hostOnly);
 
-        auto it = routes_.find(hostOnly);
-        if (it == routes_.end()) {
+        const Pattern* pat = FindPattern(hostOnly);
+        if (!pat) {
             const char* r = "HTTP/1.1 403 Forbidden\r\n"
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            send(client.get(), r, (int)strlen(r), 0);
+            return;
+        }
+
+        std::string targetIp;
+        if (!ResolveTarget(hostOnly, *pat, targetIp)) {
+            const char* r = "HTTP/1.1 502 Bad Gateway\r\n"
                             "Content-Length: 0\r\nConnection: close\r\n\r\n";
             send(client.get(), r, (int)strlen(r), 0);
             return;
@@ -442,7 +505,7 @@ private:
         sockaddr_in ta{};
         ta.sin_family = AF_INET;
         ta.sin_port   = htons(targetPort_);
-        if (InetPtonA(AF_INET, it->second.c_str(), &ta.sin_addr) != 1) return;
+        if (InetPtonA(AF_INET, targetIp.c_str(), &ta.sin_addr) != 1) return;
         if (connect(target.get(), (sockaddr*)&ta, sizeof(ta)) == SOCKET_ERROR) {
             const char* r = "HTTP/1.1 502 Bad Gateway\r\n"
                             "Content-Length: 0\r\nConnection: close\r\n\r\n";
@@ -461,10 +524,13 @@ private:
     }
 
     std::string pacContent_;
-    std::map<std::string, std::string> routes_;
+    std::vector<Pattern> patterns_;
+    std::map<std::string, std::string> ipCache_;
+    std::mutex cacheMu_;
     ScopedSocket listen_;
     unsigned short targetPort_;
     unsigned short port_ = 0;
+    std::wstring dnsServer_;
     std::atomic<bool> running_{ false };
     std::thread acceptThread_;
     std::vector<std::thread> workers_;
@@ -475,24 +541,38 @@ private:
 static std::string BuildPacContent(const std::vector<HostMapping>& hosts,
                                    unsigned short proxyPort)
 {
-    std::string list;
-    bool first = true;
+    std::string exact, suffix;
+    bool ef = true, sf = true;
     for (const auto& h : hosts) {
         if (h.domain.empty()) continue;
-        if (!first) list += ",";
-        first = false;
-        list += "\"" + WtoA(h.domain) + "\"";
+        std::string d = ToLower(WtoA(h.domain));
+        if (d.size() > 2 && d[0] == '*' && d[1] == '.') {
+            if (!sf) suffix += ",";
+            sf = false;
+            suffix += "\"" + d.substr(1) + "\"";   // ".mihoyo.com"
+        } else {
+            if (!ef) exact += ",";
+            ef = false;
+            exact += "\"" + d + "\"";
+        }
     }
 
-    return "function FindProxyForURL(url, host) {\n"
-           "    host = host.toLowerCase();\n"
-           "    var list = [" + list + "];\n"
-           "    for (var i = 0; i < list.length; i++) {\n"
-           "        if (host == list[i])\n"
-           "            return \"PROXY 127.0.0.1:" + std::to_string(proxyPort) + "\";\n"
-           "    }\n"
-           "    return \"DIRECT\";\n"
-           "}\n";
+    return
+        "function FindProxyForURL(url, host) {\n"
+        "    host = host.toLowerCase();\n"
+        "    var exact = [" + exact + "];\n"
+        "    var suffix = [" + suffix + "];\n"
+        "    var proxy = \"PROXY 127.0.0.1:" + std::to_string(proxyPort) + "\";\n"
+        "    for (var i = 0; i < exact.length; i++) {\n"
+        "        if (host === exact[i]) return proxy;\n"
+        "    }\n"
+        "    for (var j = 0; j < suffix.length; j++) {\n"
+        "        var s = suffix[j];\n"
+        "        if (host.length > s.length && host.slice(-s.length) === s) return proxy;\n"
+        "        if (host === s.slice(1)) return proxy;\n"
+        "    }\n"
+        "    return \"DIRECT\";\n"
+        "}\n";
 }
 
 int wmain(int, wchar_t**) {
@@ -506,81 +586,13 @@ int wmain(int, wchar_t**) {
     const std::wstring dnsServer = L"223.5.5.5";
 
     std::vector<HostMapping> hosts;
+
     hosts.push_back({ L"douyin.com", L"" });
-    hosts.push_back({ L"www.douyin.com", L"" });
-    hosts.push_back({ L"www-hj.douyin.com", L"" });
-    hosts.push_back({ L"v.douyin.com", L"" });
-    hosts.push_back({ L"live.douyin.com", L"" });
-    hosts.push_back({ L"sso.douyin.com", L"" });
-    hosts.push_back({ L"open.douyin.com", L"" });
-    hosts.push_back({ L"api.douyin.com", L"" });
-    hosts.push_back({ L"api-hl.douyin.com", L"" });
-    hosts.push_back({ L"api.amemv.com", L"" });
-    hosts.push_back({ L"aweme.snssdk.com", L"" });
-    hosts.push_back({ L"log.snssdk.com", L"" });
-    hosts.push_back({ L"mon.snssdk.com", L"" });
-    hosts.push_back({ L"is.snssdk.com", L"" });
-    hosts.push_back({ L"tnc3-bjlgy.zijieapi.com", L"" });
-    hosts.push_back({ L"sf1-fe.tiktokv.com", L"" });
-    hosts.push_back({ L"sf3-fe.tiktokv.com", L"" });
-    hosts.push_back({ L"v26-web.douyinvod.com", L"" });
-    hosts.push_back({ L"v3-web.douyinvod.com", L"" });
-    hosts.push_back({ L"v9-web.douyinvod.com", L"" });
-    hosts.push_back({ L"v26-web.douyinpic.com", L"" });
-    hosts.push_back({ L"p3-sign.douyinpic.com", L"" });
-    hosts.push_back({ L"p9-sign.douyinpic.com", L"" });
-    hosts.push_back({ L"p26-sign.douyinpic.com", L"" });
-    hosts.push_back({ L"p11-sign.douyinpic.com", L"" });
-
     hosts.push_back({ L"mihoyo.com", L"" });
-    hosts.push_back({ L"www.mihoyo.com", L"" });
-    hosts.push_back({ L"user.mihoyo.com", L"" });
-    hosts.push_back({ L"account.mihoyo.com", L"" });
-    hosts.push_back({ L"bbs.mihoyo.com", L"" });
-    hosts.push_back({ L"ys.mihoyo.com", L"" });
-    hosts.push_back({ L"sr.mihoyo.com", L"" });
-    hosts.push_back({ L"genshin.mihoyo.com", L"" });
-    hosts.push_back({ L"zzz.mihoyo.com", L"" });
-    hosts.push_back({ L"honkaiimpact3.mihoyo.com", L"" });
-    hosts.push_back({ L"bh3.mihoyo.com", L"" });
-    hosts.push_back({ L"wd.mihoyo.com", L"" });
-    hosts.push_back({ L"mhyy.mihoyo.com", L"" });
-    hosts.push_back({ L"webstatic.mihoyo.com", L"" });
-    hosts.push_back({ L"sdk-static.mihoyo.com", L"" });
-    hosts.push_back({ L"api-static.mihoyo.com", L"" });
-    hosts.push_back({ L"api-takumi.mihoyo.com", L"" });
-    hosts.push_back({ L"api-os-takumi.mihoyo.com", L"" });
-    hosts.push_back({ L"hk4e-sdk-s.mihoyo.com", L"" });
-    hosts.push_back({ L"log-upload.mihoyo.com", L"" });
-    hosts.push_back({ L"public-data-api.mihoyo.com", L"" });
-    hosts.push_back({ L"minor-api.mihoyo.com", L"" });
-    hosts.push_back({ L"api-takumi-static.mihoyo.com", L"" });
-    hosts.push_back({ L"act.mihoyo.com", L"" });
-    hosts.push_back({ L"upload-static.mihoyo.com", L"" });
-    hosts.push_back({ L"hk4e-api.mihoyo.com", L"" });
-    hosts.push_back({ L"hk4e-api-os.mihoyo.com", L"" });
-    hosts.push_back({ L"hk4e-sdk.mihoyo.com", L"" });
-    hosts.push_back({ L"hk4e-sdk-os.mihoyo.com", L"" });
-    hosts.push_back({ L"hyp-api.mihoyo.com", L"" });
-    hosts.push_back({ L"jhyapi.mihoyo.com", L"" });
-    hosts.push_back({ L"passport-api.mihoyo.com", L"" });
-    hosts.push_back({ L"api-cloudgame.mihoyo.com", L"" });
-    hosts.push_back({ L"cg-hk4e-api.mihoyo.com", L"" });
-    hosts.push_back({ L"cg-hk4e-sdk.mihoyo.com", L"" });
-    hosts.push_back({ L"devops-api.mihoyo.com", L"" });
-    hosts.push_back({ L"announcement-api.mihoyo.com", L"" });
-    hosts.push_back({ L"hk4e-announcement-api.mihoyo.com", L"" });
-    hosts.push_back({ L"hk4e-sdk-static.mihoyo.com", L"" });
-    hosts.push_back({ L"hk4e-static.mihoyo.com", L"" });
+    hosts.push_back({ L"*.douyin.com", L"" });
+    hosts.push_back({ L"*.mihoyo.com", L"" });
 
-    std::wstring err;
-    if (!ResolveAllHosts(hosts, dnsServer, err)) {
-        ShowError(err);
-        return 1;
-    }
-
-    RedirectProxy proxy(hosts, 80);
-    proxy.SetPacContent(BuildPacContent(hosts, 0));
+    RedirectProxy proxy(hosts, dnsServer, 80);
     if (!proxy.Start()) {
         ShowError(L"本地代理启动失败。");
         return 1;
